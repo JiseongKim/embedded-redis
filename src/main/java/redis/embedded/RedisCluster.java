@@ -9,8 +9,7 @@ import redis.embedded.exceptions.EmbeddedRedisException;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 
 public class RedisCluster implements Redis {
 
@@ -18,21 +17,19 @@ public class RedisCluster implements Redis {
     private final List<ClusterMaster> masters = new LinkedList();
     private final List<ClusterSlave> slaves = new LinkedList();
 
-    private Integer DEFAULT_TIMEOUT_WAIT_CLUSTER = 0; // 0 means, no timeout
-    private Integer waitForClusterTimeoutMS = DEFAULT_TIMEOUT_WAIT_CLUSTER;
+    private Integer waitForClusterTimeoutMS;
+    private Integer waitForSetReplicaTimeoutMS;
 
     private String meetRedisIp = null;
     private Integer meetRedisPort = null;
     private String basicAuthPassword = null;
 
     RedisCluster(List<ClusterMaster> masters, List<ClusterSlave> slaves,
-                 String meetRedisIp, Integer meetRedisPort,
-                 String basicAuthPassword) {
+                 String meetRedisIp, Integer meetRedisPort) {
         this.masters.addAll(masters);
         this.slaves.addAll(slaves);
         this.meetRedisIp = meetRedisIp;
         this.meetRedisPort = meetRedisPort;
-        this.basicAuthPassword = basicAuthPassword;
     }
 
     @Override
@@ -57,21 +54,23 @@ public class RedisCluster implements Redis {
 
             if (meetRedisIp != null && meetRedisPort != null) {
                 Jedis jedis = new Jedis(master.getMasterRedisIp(), master.getMasterRedisPort());
-                if(this.basicAuthPassword != null) {
-                    jedis.auth(this.basicAuthPassword);
+                if(this.getBasicAuthPassword() != null) {
+                    jedis.auth(this.getBasicAuthPassword());
                 }
                 jedis.clusterMeet(meetRedisIp, meetRedisPort);
             }
         }
         allocSlotsToMaster();
 
+        List<Future> replicaTasks = new LinkedList<>();
+        ExecutorService executor = Executors.newFixedThreadPool(slaves.size());
         for (ClusterSlave slave : slaves) {
             slave.getSlaveRedis().start();
 
             final Jedis jedisSlave = new Jedis(slave.getSlaveIp(), slave.getSlavePort());
 
-            if(this.basicAuthPassword != null) {
-                jedisSlave.auth(this.basicAuthPassword);
+            if (this.getBasicAuthPassword() != null) {
+                jedisSlave.auth(this.getBasicAuthPassword());
             }
             if (meetRedisIp != null && meetRedisPort != null) {
                 jedisSlave.clusterMeet(meetRedisIp, meetRedisPort);
@@ -79,15 +78,24 @@ public class RedisCluster implements Redis {
 
             final Jedis jedisMaster = new Jedis(slave.getMasterRedisIp(), slave.getMasterRedisPort());
 
-            if(this.basicAuthPassword != null) {
-                jedisMaster.auth(this.basicAuthPassword);
+            if (this.getBasicAuthPassword() != null) {
+                jedisMaster.auth(this.getBasicAuthPassword());
             }
 
-
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            executor.submit(() -> setReplica(jedisMaster, jedisSlave));
-
+            logger.info("start set replica");
+            replicaTasks.add(executeSetReplica(executor, jedisMaster, jedisSlave));
+            logger.info("end set replica");
         }
+
+        for(Future future : replicaTasks) {
+            try {
+                future.get(getWaitForSetReplicaTimeoutMS(), TimeUnit.MILLISECONDS);
+            } catch (TimeoutException | InterruptedException | ExecutionException e) {
+                logger.error(e.getMessage());
+            }
+        }
+
+        executor.shutdown();
     }
 
     @Override
@@ -152,12 +160,34 @@ public class RedisCluster implements Redis {
 
             Jedis jedis = new Jedis(master.getMasterRedisIp(), master.getMasterRedisPort());
 
-            if(this.basicAuthPassword != null) {
-                jedis.auth(this.basicAuthPassword);
+            if(this.getBasicAuthPassword() != null) {
+                jedis.auth(this.getBasicAuthPassword());
             }
 
             jedis.clusterAddSlots(nodeSlots);
         }
+    }
+
+
+    private Future executeSetReplica(ExecutorService executor, Jedis jedisMaster, Jedis jedisSlave) {
+
+        class ClusterReplicaTask implements Runnable {
+            private Jedis master;
+            private Jedis slave;
+
+            private ClusterReplicaTask(Jedis master, Jedis slave) {
+                this.master = master;
+                this.slave = slave;
+            }
+
+            public void run() {
+                logger.info("executeSetReplica {}, {}",
+                        master.getClient().getPort(),
+                        slave.getClient().getPort());
+                setReplica(master, slave);
+            }
+        }
+        return executor.submit(new ClusterReplicaTask(jedisMaster, jedisSlave));
     }
 
     public void setReplica(Jedis master, Jedis slave) {
@@ -168,11 +198,32 @@ public class RedisCluster implements Redis {
             logger.error(e.getMessage());
         }
 
+        String masterSlave = "[master:" + master.getClient().getPort() + "/" +
+                "slave:" +slave.getClient().getPort() + "]";
+
         for (String nodeInfo : master.clusterNodes().split("\n")) {
-            logger.debug("[setReplica]" + nodeInfo);
             if (nodeInfo.contains("myself")) {
-                slave.clusterReplicate(nodeInfo.split(" ")[0]);
-                break;
+                logger.debug("[setReplica][found]{}, {}",masterSlave, nodeInfo.split(" ")[0]);
+                Boolean succeed = false;
+                while(!succeed) {
+                    try {
+                        slave.clusterReplicate(nodeInfo.split(" ")[0]);
+                    } catch (Exception e) {
+                        String retryMessage =
+                                String.format("trying to set replica %s->%s",
+                                        slave.getClient().getPort(),
+                                        master.getClient().getPort());
+                        logger.info(retryMessage);
+                        try {
+                            Thread.sleep(100);
+                        } catch (InterruptedException exSleep) {
+                            logger.error(masterSlave + exSleep.getMessage());
+                        }
+                        continue;
+                    }
+                    succeed = true;
+                }
+                logger.info("[setReplica]Done {}", masterSlave);
             }
         }
     }
@@ -220,5 +271,21 @@ public class RedisCluster implements Redis {
     public RedisCluster setWaitForClusterTimeoutMS(Integer waitForClusterTimeoutMS) {
         this.waitForClusterTimeoutMS = waitForClusterTimeoutMS;
         return this;
+    }
+
+    public Integer getWaitForSetReplicaTimeoutMS() {
+        return waitForSetReplicaTimeoutMS;
+    }
+
+    public void setWaitForSetReplicaTimeoutMS(Integer waitForSetReplicaTimeoutMS) {
+        this.waitForSetReplicaTimeoutMS = waitForSetReplicaTimeoutMS;
+    }
+
+    public String getBasicAuthPassword() {
+        return basicAuthPassword;
+    }
+
+    public void setBasicAuthPassword(String basicAuthPassword) {
+        this.basicAuthPassword = basicAuthPassword;
     }
 }

@@ -18,6 +18,12 @@ public class RedisClusterBuilder {
     private Integer clusterNodeTimeoutMS = 30000; //Default timeout is 3 seconds.
     private String basicAuthPassword = null;
 
+    private Integer DEFAULT_TIMEOUT_WAIT_CLUSTER = 0; // 0 means, no timeout
+    private Integer DEFAULT_TIMEOUT_SET_REPLICA = 30000; //Default is 30 secs.
+
+    private Integer waitForClusterTimeoutMS = DEFAULT_TIMEOUT_WAIT_CLUSTER;
+    private Integer waitForSetReplicaTimeoutMS = DEFAULT_TIMEOUT_SET_REPLICA;
+
     public RedisClusterBuilder masters(Collection<ClusterMaster> masters) {
         this.masters.addAll(masters);
         return this;
@@ -39,6 +45,24 @@ public class RedisClusterBuilder {
         return this;
     }
 
+    public Integer getWaitForClusterTimeoutMS() {
+        return waitForClusterTimeoutMS;
+    }
+
+    public RedisClusterBuilder setWaitForClusterTimeoutMS(Integer waitForClusterTimeoutMS) {
+        this.waitForClusterTimeoutMS = waitForClusterTimeoutMS;
+        return this;
+    }
+
+    public Integer getWaitForSetReplicaTimeoutMS() {
+        return waitForSetReplicaTimeoutMS;
+    }
+
+    public RedisClusterBuilder setWaitForSetReplicaTimeoutMS(Integer waitForSetReplicaTimeoutMS) {
+        this.waitForSetReplicaTimeoutMS = waitForSetReplicaTimeoutMS;
+        return this;
+    }
+
     public RedisClusterBuilder basicAuthPassword(String password) {
         this.basicAuthPassword = password;
         return this;
@@ -47,7 +71,13 @@ public class RedisClusterBuilder {
     public RedisCluster build() {
         buildMasters();
         buildSlaves();
-        return new RedisCluster(masters, slaves, meetRedisIp, meetRedisPort, basicAuthPassword);
+
+        RedisCluster redisCluster = new RedisCluster(masters, slaves, meetRedisIp, meetRedisPort);
+        redisCluster.setBasicAuthPassword(basicAuthPassword);
+        redisCluster.setWaitForClusterTimeoutMS(waitForClusterTimeoutMS);
+        redisCluster.setWaitForSetReplicaTimeoutMS(waitForSetReplicaTimeoutMS);
+
+        return redisCluster;
     }
 
     public void buildMasters() {
